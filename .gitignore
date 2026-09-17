@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+
+# Never commit signing material or secrets accidentally dropped into the repo.
+*.keystore
+*.jks
+github_secrets_setup.txt

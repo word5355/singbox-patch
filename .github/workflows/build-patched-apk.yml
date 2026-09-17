@@ -1,0 +1,308 @@
+name: Build patched sing-box-for-android APKs
+
+# Adds <uses-permission android:name="android.permission.INTERACT_ACROSS_USERS" />
+# to the official sing-box-for-android release APKs, re-signs them with our own
+# key, and republishes them as a release on THIS repo so Obtainium can track it.
+#
+# Why patch the official APK instead of rebuilding from source: the official
+# release already ships finished, signed(by upstream) APKs as release assets.
+# Patching the manifest with apktool and re-signing takes ~2 minutes per APK
+# and needs no NDK/Go/Gradle toolchain. See README for the source-rebuild
+# fallback if this ever breaks (e.g. R8 output stops round-tripping).
+#
+# Background: https://github.com/SagerNet/sing-box/issues/4246
+#
+# Speed notes:
+# - Each APK asset is patched in its own parallel matrix job instead of a
+#   serial loop, so wall-clock time is ~1 asset's worth, not ~10.
+# - JDK: uses the Temurin 17 already preinstalled on ubuntu-latest runners
+#   (JAVA_HOME_17_X64) instead of downloading one via actions/setup-java.
+# - apktool.jar and the Android build-tools are cached across runs
+#   (actions/cache, keyed by pinned version) since they rarely change.
+
+on:
+  schedule:
+    # Poll every 6 hours. GitHub's scheduler can lag 5-30min under load; that's fine here.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream sing-box tag to (re)build, e.g. v1.14.1. Leave empty for latest stable."
+        required: false
+        type: string
+      force:
+        description: "Rebuild even if this tag was already published here"
+        required: false
+        type: boolean
+        default: false
+      abi:
+        description: "Android ABI to build, e.g. arm64-v8a, armeabi-v7a, x86_64. Leave empty to use DEFAULT_ABI below."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-patched-apk
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: SagerNet/sing-box
+  DEFAULT_ABI: "arm64-v8a" # change this to build a different ABI on the schedule trigger
+  APKTOOL_VERSION: "3.0.3"
+  APKTOOL_SHA256: "dbf930b076c6b9be08d57c449cacefc3bdd6b71ebd59b3066fc0e1f5b14f9423"
+  BUILD_TOOLS_VERSION: "35.0.0"
+
+jobs:
+  check:
+    name: Check for a new upstream release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+      tag: ${{ steps.decide.outputs.tag }}
+      assets: ${{ steps.decide.outputs.assets }}
+      upstream_url: ${{ steps.decide.outputs.upstream_url }}
+      upstream_body: ${{ steps.decide.outputs.upstream_body }}
+    steps:
+      - name: Decide whether to build
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          FORCE: ${{ github.event.inputs.force }}
+          INPUT_ABI: ${{ github.event.inputs.abi }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_TAG:-}" ]; then
+            release_json=$(gh api "repos/${UPSTREAM_REPO}/releases/tags/${INPUT_TAG}")
+          else
+            # /releases/latest already excludes prereleases (alpha/beta/rc) and drafts,
+            # so this tracks the stable channel by construction.
+            release_json=$(gh api "repos/${UPSTREAM_REPO}/releases/latest")
+          fi
+
+          tag=$(echo "$release_json" | jq -r '.tag_name')
+          html_url=$(echo "$release_json" | jq -r '.html_url')
+          echo "Upstream tag: $tag"
+
+          ABI="${INPUT_ABI:-$DEFAULT_ABI}"
+          echo "Target ABI: $ABI"
+
+          # Only the plain per-ABI APK (not the legacy-android-5 variant, and
+          # not the universal one). Change DEFAULT_ABI above, or pass the abi
+          # input on a manual run, to build a different ABI.
+          assets=$(echo "$release_json" | jq -c --arg abi "$ABI" \
+            '[.assets[] | select((.name | test("^SFA-.*" + $abi + "\\.apk$")) and (.name | test("legacy-android-5") | not)) | {name: .name, url: .browser_download_url}]')
+          asset_count=$(echo "$assets" | jq 'length')
+          echo "Found $asset_count APK asset(s) for $tag"
+
+          if [ "$asset_count" -eq 0 ]; then
+            echo "No APK assets attached yet (publish_android may not have run for this tag). Skipping."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${FORCE:-false}" != "true" ] && gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "$tag already published in this repo. Skipping."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "upstream_url=$html_url" >> "$GITHUB_OUTPUT"
+          echo "assets=$assets" >> "$GITHUB_OUTPUT"
+
+          # Multiline value: use a random delimiter per GITHUB_OUTPUT's heredoc syntax.
+          delim="UPSTREAM_BODY_$(date +%s%N)"
+          {
+            echo "upstream_body<<$delim"
+            echo "$release_json" | jq -r '.body // ""'
+            echo "$delim"
+          } >> "$GITHUB_OUTPUT"
+
+  patch:
+    name: Patch (${{ matrix.asset.name }})
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        asset: ${{ fromJson(needs.check.outputs.assets) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+
+      - name: Use preinstalled Temurin 17 (skip JDK download)
+        run: |
+          set -euo pipefail
+          if [ -z "${JAVA_HOME_17_X64:-}" ]; then
+            echo "::error::JAVA_HOME_17_X64 not set by the runner image; fall back to actions/setup-java"
+            exit 1
+          fi
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_17_X64/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Android build-tools
+        id: cache-build-tools
+        uses: actions/cache@v4
+        with:
+          path: ~/android-sdk
+          key: android-build-tools-${{ env.BUILD_TOOLS_VERSION }}
+
+      - name: Install Android build-tools (aapt2, zipalign, apksigner)
+        if: steps.cache-build-tools.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/android-sdk/cmdline-tools
+          curl -sL -o /tmp/cmdline-tools.zip "https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip"
+          unzip -q /tmp/cmdline-tools.zip -d ~/android-sdk/cmdline-tools
+          mv ~/android-sdk/cmdline-tools/cmdline-tools ~/android-sdk/cmdline-tools/latest
+
+          # `yes` gets SIGPIPE once sdkmanager stops reading stdin (all licenses
+          # accepted) and exits non-zero even though sdkmanager itself succeeded.
+          # Under pipefail that would fail this step, so disable it just here and
+          # check sdkmanager's own exit status via PIPESTATUS instead.
+          set +o pipefail
+          yes | ~/android-sdk/cmdline-tools/latest/bin/sdkmanager --sdk_root="$HOME/android-sdk" --licenses > /dev/null
+          sdkmanager_status="${PIPESTATUS[1]}"
+          set -o pipefail
+          if [ "$sdkmanager_status" -ne 0 ]; then
+            echo "::error::sdkmanager --licenses failed with exit code $sdkmanager_status"
+            exit "$sdkmanager_status"
+          fi
+
+          ~/android-sdk/cmdline-tools/latest/bin/sdkmanager --sdk_root="$HOME/android-sdk" "build-tools;${BUILD_TOOLS_VERSION}"
+
+      - name: Cache apktool.jar
+        id: cache-apktool
+        uses: actions/cache@v4
+        with:
+          path: /tmp/apktool.jar
+          key: apktool-${{ env.APKTOOL_VERSION }}
+
+      - name: Download apktool
+        if: steps.cache-apktool.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -sL -o /tmp/apktool.jar "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar"
+
+      - name: Verify apktool checksum
+        run: echo "${APKTOOL_SHA256}  /tmp/apktool.jar" | sha256sum -c -
+
+      - name: Decode signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.APK_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          echo "$KEYSTORE_BASE64" | base64 -d > /tmp/release.keystore
+
+      - name: Patch, rebuild and sign
+        env:
+          KEYSTORE_PASS: ${{ secrets.APK_KEYSTORE_PASS }}
+          KEY_ALIAS: ${{ secrets.APK_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.APK_KEY_PASS }}
+          ASSET_NAME: ${{ matrix.asset.name }}
+          ASSET_URL: ${{ matrix.asset.url }}
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS="$HOME/android-sdk/build-tools/${BUILD_TOOLS_VERSION}"
+          base="${ASSET_NAME%.apk}"
+          mkdir -p dist
+          curl -sL -o "$ASSET_NAME" "$ASSET_URL"
+
+          java -jar /tmp/apktool.jar d "$ASSET_NAME" -o decoded
+
+          python3 "$GITHUB_WORKSPACE/scripts/patch_manifest.py" decoded/AndroidManifest.xml
+
+          java -jar /tmp/apktool.jar b decoded -o "${base}-unsigned.apk"
+
+          "$BUILD_TOOLS/zipalign" -p 4 "${base}-unsigned.apk" "${base}-aligned.apk"
+
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks /tmp/release.keystore \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass "pass:$KEYSTORE_PASS" \
+            --key-pass "pass:$KEY_PASS" \
+            --out "dist/${base}-patched.apk" \
+            "${base}-aligned.apk"
+
+          # Fail the build rather than silently publish an unpatched APK.
+          "$BUILD_TOOLS/aapt2" dump permissions "dist/${base}-patched.apk" \
+            | grep -q "android.permission.INTERACT_ACROSS_USERS" \
+            || { echo "::error::$ASSET_NAME: permission missing from rebuilt APK"; exit 1; }
+
+      - name: Upload patched APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-apk-${{ matrix.asset.name }}
+          path: dist/*.apk
+          retention-days: 1
+
+  publish:
+    name: Publish release
+    needs: [check, patch]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download all patched APKs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: patched-apk-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check.outputs.tag }}
+          UPSTREAM_URL: ${{ needs.check.outputs.upstream_url }}
+          UPSTREAM_BODY: ${{ needs.check.outputs.upstream_body }}
+          PATCH_SCRIPT_URL: ${{ github.server_url }}/${{ github.repository }}/blob/main/scripts/patch_manifest.py
+        run: |
+          set -euo pipefail
+          ls -la dist
+
+          notes_file=$(mktemp)
+          cat > "$notes_file" <<EOF
+          **This is a patched, unofficial build of sing-box-for-android ${TAG} — not the official SagerNet release.**
+
+          Adds \`android.permission.INTERACT_ACROSS_USERS\` to the manifest,
+          so it can be granted via \`adb shell pm grant io.nekohasekai.sfa android.permission.INTERACT_ACROSS_USERS\`
+          to allow cross-profile loopback routing (blocked by default since Android 17).
+
+          Background: https://github.com/SagerNet/sing-box/issues/4246
+          Upstream release (source, GPL-3.0-or-later): ${UPSTREAM_URL}
+          Patch script (the only change from upstream's binary): ${PATCH_SCRIPT_URL}
+
+          This is signed with a locally-generated key, not SagerNet's. If you
+          previously had the official app installed, you must uninstall it
+          first (same applicationId, different signature).
+
+          Not affiliated with SagerNet. Built by this repo's GitHub Actions
+          workflow from unmodified upstream APKs, patched with apktool.
+          EOF
+
+          # Append upstream's own release notes verbatim (not embedded in the
+          # heredoc above, since they're untrusted content that could contain
+          # a line that collides with the EOF marker).
+          if [ -n "$UPSTREAM_BODY" ]; then
+            {
+              echo ""
+              echo "---"
+              echo ""
+              echo "## Upstream release notes (${TAG})"
+              echo ""
+              printf '%s\n' "$UPSTREAM_BODY"
+            } >> "$notes_file"
+          fi
+
+          gh release create "$TAG" dist/*.apk \
+            --repo "${{ github.repository }}" \
+            --title "$TAG (patched: INTERACT_ACROSS_USERS)" \
+            --notes-file "$notes_file"

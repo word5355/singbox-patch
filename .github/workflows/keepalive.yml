@@ -1,0 +1,40 @@
+name: Keepalive
+
+# GitHub automatically disables a workflow's `schedule` trigger after 60 days
+# without a git push to the repo's default branch. This repo's main workflow
+# only creates releases/tags (which don't count, and don't touch main
+# anyway) so without this, the 6-hourly upstream-check schedule would
+# eventually go silently disabled regardless of how often upstream releases.
+#
+# GitHub's inactivity check only looks at the default branch (confirmed by
+# how existing keepalive actions like efrecon/gh-action-keepalive work), so
+# this has to commit to main. Kept to one line in one file, once a month, to
+# stay out of the way.
+
+on:
+  schedule:
+    - cron: "0 0 1 * *" # monthly, well under the 60-day disable threshold
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    name: Push keepalive commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+
+      - name: Push timestamp to main
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/keepalive
+          git add .github/keepalive
+          git commit -m "Keepalive: $(date -u +%Y-%m-%d)"
+          git push origin HEAD:main

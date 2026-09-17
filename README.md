@@ -67,9 +67,10 @@ caveats](#known-caveats) below.
   already installed you must uninstall it first** (the `applicationId`
   stays `io.nekohasekai.sfa`, so future updates from this repo will install
   over each other fine).
-- The workflow tracks the stable channel only (`/releases/latest`, which
-  excludes prereleases). Edit the `check` job's API call if you also want
-  alpha/beta.
+- By default the workflow also tracks prereleases (alpha/beta/rc), not just
+  stable. Set `DEFAULT_INCLUDE_PRERELEASES` to `"false"` near the top of the
+  workflow to track stable only on the schedule trigger, or pass
+  `include_prereleases: false` on a manual run.
 - `publish_android` is a manual `workflow_dispatch` job upstream, so there
   can be a lag between a tag being created and its APK assets being
   attached. This workflow keys off "do SFA-*.apk assets exist" rather than

@@ -17,6 +17,11 @@ This repo is a small, unofficial, GitHub-Actions-only pipeline that:
   track for auto-installs (`io.nekohasekai.sfa`, same applicationId as the
   official app). The release notes carry over upstream's own release notes,
   after a notice that this is a patched, unofficial build.
+- Attaches a signed [build provenance
+  attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds)
+  to every APK, so anyone can verify it was actually built by this repo's
+  workflow and not swapped out after the fact (see [Verifying a
+  release](#verifying-a-release)).
 - Builds one ABI, `arm64-v8a` by default — change the `DEFAULT_ABI` value
   near the top of the workflow file to build a different one (`armeabi-v7a`,
   `x86_64`, etc.) on the schedule trigger, or pass an `abi` input when
@@ -79,6 +84,26 @@ caveats](#known-caveats) below.
 
 See [NOTES.md](NOTES.md) for what was verified on-device about how
 cross-profile loopback actually behaves, and other implementation notes.
+
+## Verifying a release
+
+Every APK this repo publishes carries a signed [build provenance
+attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds)
+(free for public repos, no setup required — it's generated automatically by
+the `publish` job). It proves the file was built by this repo's GitHub
+Actions workflow from a specific commit, not assembled or swapped out by
+hand afterward — a check that a re-signed APK's signature alone can't give
+you. After downloading a release asset, verify it with the [GitHub
+CLI](https://cli.github.com/):
+
+```
+gh attestation verify SFA-<version>-arm64-v8a-patched.apk --repo <owner>/<repo>
+```
+
+This doesn't replace checking the signature (still a locally-generated key,
+not SagerNet's — see [Known caveats](#known-caveats)); it only tells you the
+build pipeline you can already read in this repo is what actually produced
+the file.
 
 ## License
 

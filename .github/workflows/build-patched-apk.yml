@@ -266,6 +266,10 @@ jobs:
     needs: [check, patch]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Download all patched APKs
         uses: actions/download-artifact@v4
@@ -274,6 +278,11 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: "dist/*.apk"
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -281,6 +290,8 @@ jobs:
           UPSTREAM_URL: ${{ needs.check.outputs.upstream_url }}
           UPSTREAM_BODY: ${{ needs.check.outputs.upstream_body }}
           PATCH_SCRIPT_URL: ${{ github.server_url }}/${{ github.repository }}/blob/main/scripts/patch_manifest.py
+          REPO: ${{ github.repository }}
+          BUILD_COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
         run: |
           set -euo pipefail
           ls -la dist
@@ -300,6 +311,13 @@ jobs:
           This is signed with a locally-generated key, not SagerNet's. If you
           previously had the official app installed, you must uninstall it
           first (same applicationId, different signature).
+
+          Built from: ${BUILD_COMMIT_URL}
+
+          This build also has a signed provenance attestation proving it was
+          built by this repo's GitHub Actions workflow from that commit, not
+          swapped out after the fact. Verify with the GitHub CLI:
+          \`gh attestation verify <downloaded-apk> --repo ${REPO}\`
 
           Not affiliated with SagerNet. Built by this repo's GitHub Actions
           workflow from unmodified upstream APKs, patched with apktool.
